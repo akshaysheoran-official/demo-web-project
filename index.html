@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Gesture Ball Loader</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; }
+        #container { width: 100%; height: 100vh; display: block; }
+        #videoElement { position: absolute; top: 0; left: 0; opacity: 0; z-index: -1; }
+        #loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: white; font-family: sans-serif; font-size: 24px; pointer-events: none;}
+        #instructions { position: absolute; top: 10px; left: 10px; color: #00ff00; background: rgba(0,0,0,0.5); padding: 10px; font-family: monospace; pointer-events: none;}
+    </style>
+</head>
+<body>
+    <div id="loading">Loading AI Vision & Physics Models...</div>
+    <div id="instructions">Make a PINCH gesture (thumb + index) to grab the RED ball. Release to drop in the grey truck bed.</div>
+    <video id="videoElement" playsinline></video>
+    <div id="container"></div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.158.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.158.0/examples/jsm/",
+                "cannon-es": "https://unpkg.com/cannon-es@0.20.0/dist/cannon-es.js"
+            }
+        }
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import * as CANNON from 'cannon-es';
+
+        let scene, camera, renderer, controls;
+        let world, timeStep = 1 / 60;
+        let ballMesh, ballBody;
+        let handMarkerMesh;
+        let isPinching = false;
+        let isGrabbingBall = false;
+        const videoElement = document.getElementById('videoElement');
+        const loadingEl = document.getElementById('loading');
+
+        // Hand tracking variables
+        let handPosition = new THREE.Vector3();
+        const PINCH_THRESHOLD = 0.05; // Distance between thumb and index to trigger pinch
+        const GRAB_DISTANCE = 2.5; // How close hand must be to ball to grab
+
+        initThree();
+        initCannon();
+        buildScenery();
+        initMediaPipe();
+        animate();
+
+        function initThree() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x87CEEB); // Sky blue
+            scene.fog = new THREE.Fog(0x87CEEB, 10, 50);
+
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+            camera.position.set(0, 5, 10);
+            camera.lookAt(0, 0, 0);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.shadowMap.enabled = true;
+            document.getElementById('container').appendChild(renderer.domElement);
+
+            // Lighting
+            const ambientLight = new THREE.AmbientLight(0x404040, 2);
+            scene.add(ambientLight);
+            const dirLight = new THREE.DirectionalLight(0xffffff, 2);
+            dirLight.position.set(10, 20, 10);
+            dirLight.castShadow = true;
+            dirLight.shadow.camera.top = 20;
+            dirLight.shadow.camera.bottom = -20;
+            dirLight.shadow.camera.left = -20;
+            dirLight.shadow.camera.right = 20;
+            scene.add(dirLight);
+
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.target.set(0, 1, 0);
+            controls.update();
+
+            // The "Ghost Hand" marker
+            const handGeo = new THREE.SphereGeometry(0.3, 16, 16);
+            const handMat = new THREE.MeshBasicMaterial({ color: 0x00ff00, transparent: true, opacity: 0.5 });
+            handMarkerMesh = new THREE.Mesh(handGeo, handMat);
+            scene.add(handMarkerMesh);
+
+            window.addEventListener('resize', onWindowResize);
+        }
+
+        function initCannon() {
+            world = new CANNON.World({
+                gravity: new CANNON.Vec3(0, -9.82, 0), // Earth gravity
+            });
+
+            // Ground physics
+            const groundBody = new CANNON.Body({
+                type: CANNON.Body.STATIC,
+                shape: new CANNON.Plane(),
+            });
+            groundBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0); // Rotate plane to be flat
+            world.addBody(groundBody);
+
+            // Ball Physics and Mesh
+            const ballRadius = 0.5;
+            ballMesh = new THREE.Mesh(
+                new THREE.SphereGeometry(ballRadius, 32, 32),
+                new THREE.MeshStandardMaterial({ color: 0xff0000, roughness: 0.4 })
+            );
+            ballMesh.position.set(-3, 2, 3);
+            ballMesh.castShadow = true;
+            scene.add(ballMesh);
+
+            ballBody = new CANNON.Body({
+                mass: 1, // Dynamic object
+                shape: new CANNON.Sphere(ballRadius),
+                position: new CANNON.Vec3(-3, 2, 3),
+            });
+            world.addBody(ballBody);
+        }
+
+        // Helper to create static boxes (for truck bed walls)
+        function createStaticBox(w, h, d, x, y, z, color) {
+             // Visual
+            const mesh = new THREE.Mesh(
+                new THREE.BoxGeometry(w, h, d),
+                new THREE.MeshStandardMaterial({ color: color })
+            );
+            mesh.position.set(x, y, z);
+            mesh.castShadow = true;
+            mesh.receiveShadow = true;
+            scene.add(mesh);
+
+            // Physics
+            const body = new CANNON.Body({
+                mass: 0, // Static
+                shape: new CANNON.Box(new CANNON.Vec3(w/2, h/2, d/2)),
+                position: new CANNON.Vec3(x, y, z)
+            });
+            world.addBody(body);
+        }
+
+        function buildScenery() {
+            // Ground visual
+            const groundMesh = new THREE.Mesh(
+                new THREE.PlaneGeometry(100, 100),
+                new THREE.MeshStandardMaterial({ color: 0x228B22, roughness: 0.8 }) // Forest green
+            );
+            groundMesh.rotation.x = -Math.PI / 2;
+            groundMesh.receiveShadow = true;
+            scene.add(groundMesh);
+
+            // --- The Truck (Simplified geometry) ---
+            const truckColor = 0x888888;
+            // Truck Base
+            createStaticBox(4, 0.5, 6, 2, 0.25, 0, truckColor);
+            // Truck Cabin
+            createStaticBox(3.8, 2, 2, 2, 1.5, -2, 0x666666);
+            // Truck Bed Walls (The container)
+            createStaticBox(0.2, 1, 3.8, 0.1, 1, 1, truckColor); // Left wall
+            createStaticBox(0.2, 1, 3.8, 3.9, 1, 1, truckColor); // Right wall
+            createStaticBox(4, 1, 0.2, 2, 1, 2.9, truckColor); // Back wall
+            createStaticBox(4, 1, 0.2, 2, 1, -0.9, truckColor); // Front wall/cabin divider
+
+            // --- Scenery Placeholders ---
+            // Simple Trees (Cones and cylinders)
+            for(let i = 0; i < 20; i++) {
+                const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.3, 1), new THREE.MeshStandardMaterial({color: 0x8B4513}));
+                const leaves = new THREE.Mesh(new THREE.ConeGeometry(1.5, 3, 8), new THREE.MeshStandardMaterial({color: 0x006400}));
+                
+                const x = (Math.random() - 0.5) * 40;
+                const z = (Math.random() - 0.5) * 40;
+                // Keep center clear
+                if(Math.abs(x) < 5 && Math.abs(z) < 5) continue;
+
+                trunk.position.set(x, 0.5, z);
+                leaves.position.set(x, 2.5, z);
+                trunk.castShadow = true; leaves.castShadow = true;
+                scene.add(trunk); scene.add(leaves);
+            }
+
+            // Simple People placeholder (cylinders)
+            const personGeo = new THREE.CylinderGeometry(0.3, 0.3, 1.8);
+            const personMat = new THREE.MeshStandardMaterial({color: 0xFFA07A});
+            const p1 = new THREE.Mesh(personGeo, personMat); p1.position.set(-5, 0.9, -5);
+            const p2 = new THREE.Mesh(personGeo, personMat); p2.position.set(6, 0.9, -7);
+            scene.add(p1); scene.add(p2);
+        }
+
+        function initMediaPipe() {
+            const hands = new Hands({locateFile: (file) => {
+                return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+            }});
+
+            hands.setOptions({
+                maxNumHands: 1,
+                modelComplexity: 1,
+                minDetectionConfidence: 0.7,
+                minTrackingConfidence: 0.7
+            });
+
+            hands.onResults(onHandsResults);
+
+            const camera = new Camera(videoElement, {
+                onFrame: async () => {
+                    await hands.send({image: videoElement});
+                },
+                width: 640,
+                height: 480
+            });
+            camera.start().then(() => {
+                loadingEl.style.display = 'none';
+            });
+        }
+
+        function onHandsResults(results) {
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const landmarks = results.multiHandLandmarks[0];
+
+                // Index finger tip (Landmark 8)
+                const indexTip = landmarks[8];
+                // Thumb tip (Landmark 4)
+                const thumbTip = landmarks[4];
+
+                // Map 2D video coordinates to 3D scene coordinates based on camera position
+                // We map video X to scene X, and video Y to scene Z (depth), keeping Y fixed for simplicity
+                // Note: Video x coordinates are mirrored.
+                const mappedX = (0.5 - indexTip.x) * 15; 
+                const mappedZ = (indexTip.y - 0.5) * 10 + 2; // +2 offset to bring it closer to truck
+                const fixedY = 3; // Keep hand at a steady height for easier grabbing
+
+                handPosition.set(mappedX, fixedY, mappedZ);
+                handMarkerMesh.position.copy(handPosition);
+
+                // Calculate distance for pinch detection
+                const dx = indexTip.x - thumbTip.x;
+                const dy = indexTip.y - thumbTip.y;
+                // Simple 2D distance in video space usually suffices for pinch check
+                const distance = Math.sqrt(dx * dx + dy * dy);
+
+                if (distance < PINCH_THRESHOLD) {
+                    if (!isPinching) {
+                        console.log("Pinch Started");
+                        handMarkerMesh.material.color.set(0xff0000); // Red when pinching
+                        isPinching = true;
+                        tryGrab();
+                    }
+                } else {
+                    if (isPinching) {
+                         console.log("Pinch Released");
+                        handMarkerMesh.material.color.set(0x00ff00); // Green when open
+                        isPinching = false;
+                        releaseGrab();
+                    }
+                }
+            }
+        }
+
+        function tryGrab() {
+            const distanceToBall = handPosition.distanceTo(ballMesh.position);
+            if (distanceToBall < GRAB_DISTANCE) {
+                isGrabbingBall = true;
+                // IMPORTANT: When grabbing, we effectively disable physics forces on the ball
+                // so we can manually control its position.
+                ballBody.mass = 0;
+                ballBody.updateMassProperties();
+                ballBody.velocity.set(0,0,0);
+                ballBody.angularVelocity.set(0,0,0);
+            }
+        }
+
+        function releaseGrab() {
+            if (isGrabbingBall) {
+                isGrabbingBall = false;
+                // Re-enable physics mass so gravity takes over
+                ballBody.mass = 1;
+                ballBody.updateMassProperties();
+                // Optional: Add a slight downward velocity on release
+                ballBody.velocity.set(0,-1,0);
+            }
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            // Step 1: Update Physics
+            world.step(timeStep);
+
+            // Step 2: Handle Grabbing Logic
+            if (isGrabbingBall && isPinching) {
+                // Hard-set ball physics position to the hand marker position
+                ballBody.position.copy(handMarkerMesh.position);
+                // Reset velocity again to prevent physics engine fighting us
+                ballBody.velocity.set(0,0,0);
+            }
+
+            // Step 3: Sync Visuals to Physics
+            ballMesh.position.copy(ballBody.position);
+            ballMesh.quaternion.copy(ballBody.quaternion);
+
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>
